@@ -12,20 +12,32 @@ from datetime import datetime, timedelta
 from dotenv import load_dotenv
 load_dotenv()
 
-import requests
-from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
-import anthropic
+# Load environment variables immediately after dotenv
+ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
+FOURSQUARE_API_KEY = os.getenv("FOURSQUARE_API_KEY")
+GEOAPIFY_API_KEY = os.getenv("GEOAPIFY_API_KEY")
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Initialize Anthropic client after loading environment variables
-api_key = os.getenv("ANTHROPIC_API_KEY")
-if not api_key:
-    raise RuntimeError("ANTHROPIC_API_KEY not found in environment variables. Please set it in your .env file.")
-client = anthropic.Anthropic(api_key=api_key)
+# Check API keys with warnings instead of errors
+if not ANTHROPIC_API_KEY:
+    logging.warning("ANTHROPIC_API_KEY not found in environment variables. Please set it in your .env file.")
+
+if not FOURSQUARE_API_KEY:
+    logging.warning("FOURSQUARE_API_KEY not found in environment variables. Please set it in your .env file.")
+
+if not GEOAPIFY_API_KEY:
+    logging.warning("GEOAPIFY_API_KEY not found in environment variables. Please set it in your .env file.")
+
+import requests
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel
+import anthropic
+
+# Initialize Anthropic client
+client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY) if ANTHROPIC_API_KEY else None
 
 # Initialize FastAPI app
 app = FastAPI(
@@ -39,7 +51,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["http://localhost:5173", "http://127.0.0.1:5173", "*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -79,6 +91,12 @@ class AdvisorRequest(BaseModel):
     city: str
     activity: str
     days_ahead: int
+
+
+class DetailsRequest(BaseModel):
+    """Request model for details endpoint."""
+    city: str
+    place_name: str
 
 
 @app.get("/health")
@@ -210,114 +228,82 @@ async def get_weather(request: WeatherRequest) -> Dict[str, Any]:
         }
 
 
-async def convert_activity_to_osm_tags(activity: str) -> Optional[Dict[str, str]]:
+GEOAPIFY_CATEGORIES = {
+    "cafe": "catering.cafe",
+    "coffee": "catering.cafe",
+    "matcha": "catering.cafe",
+    "tea": "catering.cafe",
+    "restaurant": "catering.restaurant",
+    "food": "catering.restaurant",
+    "bar": "catering.bar",
+    "pub": "catering.bar",
+    "fast food": "catering.fast_food",
+    "fitness": "sport",
+    "gym": "sport",
+    "karting": "sport",
+    "go kart": "sport",
+    "sport": "sport",
+    "billiards": "entertainment",
+    "pool": "entertainment",
+    "bowling": "entertainment.bowling_alley",
+    "arcade": "entertainment.amusement_arcade",
+    "cinema": "entertainment.cinema",
+    "movie": "entertainment.cinema",
+    "park": "leisure",
+    "museum": "tourism.museum",
+    "hotel": "accommodation.hotel",
+}
+
+
+def get_geoapify_category(activity: str) -> str:
     """
-    Convert activity description to OpenStreetMap tags using Claude AI.
+    Convert activity to Geoapify category using keyword matching.
     
     Args:
-        activity: User's activity description (e.g., "billiards")
+        activity: User's activity description
         
     Returns:
-        Dictionary with key and value for OSM tags, or None if failed
+        Geoapify category string
     """
     try:
-        logger.info(f"Converting activity '{activity}' to OSM tags")
-        prompt = f"""You are an OpenStreetMap expert. Convert the activity '{activity}' 
-to the correct OpenStreetMap tag pair.
-
-Common examples:
-- billiards/pool → {{"key": "leisure", "value": "billiard_hall"}}
-- restaurant → {{"key": "amenity", "value": "restaurant"}}
-- coffee shop → {{"key": "amenity", "value": "cafe"}}
-- gym/fitness → {{"key": "leisure", "value": "fitness_centre"}}
-- bar/pub → {{"key": "amenity", "value": "pub"}}
-- cinema/movies → {{"key": "amenity", "value": "cinema"}}
-- bowling → {{"key": "leisure", "value": "bowling_alley"}}
-- park → {{"key": "leisure", "value": "park"}}
-- hotel → {{"key": "tourism", "value": "hotel"}}
-- museum → {{"key": "tourism", "value": "museum"}}
-
-Respond with ONLY a valid raw JSON object, no markdown, no explanation.
-Use the most commonly used OSM tag for this activity."""
+        logger.info(f"Converting activity '{activity}' to Geoapify category")
         
-        message = client.messages.create(
-            model="claude-haiku-4-5",
-            max_tokens=100,
-            messages=[
-                {"role": "user", "content": prompt}
-            ]
-        )
+        # Lowercase the activity for matching
+        activity_lower = activity.lower()
         
-        raw_response = message.content[0].text
+        # Check for keyword matches
+        for keyword, category in GEOAPIFY_CATEGORIES.items():
+            if keyword in activity_lower:
+                logger.info(f"Matched keyword '{keyword}' to category '{category}'")
+                return category
         
-        # Clean the response by removing markdown code blocks
-        cleaned_response = raw_response.strip()
-        cleaned_response = cleaned_response.replace("```json", "").replace("```", "").strip()
+        # Default to restaurant if no match found
+        logger.info(f"No keyword match found, defaulting to 'catering.restaurant'")
+        return "catering.restaurant"
         
-        # Parse the JSON response
-        import json
-        tags = json.loads(cleaned_response)
-        logger.info(f"Successfully converted activity to OSM tags: {tags}")
-        return tags
     except Exception as e:
-        logger.error(f"Error converting activity to OSM tags: {str(e)}")
-        return None
+        logger.error(f"Error converting activity to Geoapify category: {str(e)}")
+        return "catering.restaurant"
 
 
-async def get_city_bounding_box(city: str) -> Optional[Dict[str, float]]:
+async def get_places_from_claude(city: str, activity: str, city_lat: float, city_lon: float) -> Optional[list]:
     """
-    Get bounding box for a city using Nominatim API.
-    
-    Args:
-        city: Name of the city
-        
-    Returns:
-        Dictionary with south, west, north, east bounds, or None if not found
-    """
-    try:
-        logger.info(f"Getting bounding box for city: {city}")
-        url = f"https://nominatim.openstreetmap.org/search?q={city}&format=json&limit=1"
-        headers = {"User-Agent": "City-Activity-Advisor/1.0"}
-        response = requests.get(url, headers=headers, timeout=10)
-        response.raise_for_status()
-        
-        data = response.json()
-        if len(data) > 0:
-            result = data[0]
-            bbox = result["boundingbox"]
-            # bbox format: [south, north, west, east]
-            bounding_box = {
-                "south": float(bbox[0]),
-                "west": float(bbox[2]), 
-                "north": float(bbox[1]),
-                "east": float(bbox[3])
-            }
-            logger.info(f"Successfully got bounding box for {city}")
-            return bounding_box
-        return None
-    except Exception as e:
-        logger.error(f"Error getting bounding box for {city}: {str(e)}")
-        return None
-
-
-async def get_places_from_claude(city: str, activity: str) -> Optional[list]:
-    """
-    Get place suggestions from Claude when OpenStreetMap has no data.
+    Get place suggestions from Claude when Geoapify results don't match.
     
     Args:
         city: Name of the city
         activity: Activity to find places for
+        city_lat: City center latitude
+        city_lon: City center longitude
         
     Returns:
         List of AI-suggested places, or None if failed
     """
     try:
         logger.info(f"Getting places from Claude for {activity} in {city}")
-        prompt = f"""List 3-5 real places in {city} where someone can do {activity}. 
-Respond ONLY with raw JSON, no markdown, no explanation, in this exact format:
-[
-  {{"name": "Place Name", "address": "Street address or area", "note": "One short tip"}},
-]"""
+        prompt = f"""List 3-5 real places in {city} where someone can do {activity}.
+Respond ONLY with raw JSON, no markdown:
+[{{"name": "Place Name", "address": "Street address", "category": "Type of place"}}]"""
         
         message = client.messages.create(
             model="claude-haiku-4-5",
@@ -337,9 +323,13 @@ Respond ONLY with raw JSON, no markdown, no explanation, in this exact format:
         import json
         places = json.loads(cleaned_response)
         
-        # Add source field to each place
+        # Add source and coordinates to each place
         for place in places:
             place["source"] = "ai_suggested"
+            place["lat"] = city_lat
+            place["lon"] = city_lon
+            place["google_maps_url"] = f"https://www.google.com/maps/search/{place['name'].replace(' ', '+')}+{city.replace(' ', '+')}"
+            place["rating"] = None
         
         logger.info(f"Successfully got {len(places)} places from Claude")
         return places
@@ -348,68 +338,240 @@ Respond ONLY with raw JSON, no markdown, no explanation, in this exact format:
         return None
 
 
-async def find_places_with_osm_tags(key: str, value: str, bbox: Dict[str, float]) -> Optional[list]:
+NICHE_ACTIVITIES = [
+    "karting", "go kart", "billiards", "pool", "snooker",
+    "escape room", "laser tag", "paintball", "trampoline",
+    "climbing", "archery", "mini golf", "axe throwing",
+    "virtual reality", "vr", "bowling"
+]
+
+
+async def find_places_with_geoapify(city: str, activity: str) -> Optional[list]:
     """
-    Find places using OpenStreetMap Overpass API.
+    Find places using Geoapify Places API or Claude fallback for niche activities.
     
     Args:
-        key: OSM tag key (e.g., "leisure")
-        value: OSM tag value (e.g., "billiards")
-        bbox: Bounding box with south, west, north, east
+        city: Name of the city
+        activity: Activity to search for
         
     Returns:
-        List of places with name and coordinates, or None if failed
+        List of places with detailed information, or None if failed
     """
     try:
-        logger.info(f"Searching OSM for {key}={value}")
+        logger.info(f"Searching Geoapify for {activity} in {city}")
+        logger.info(f"Geoapify key loaded: {bool(GEOAPIFY_API_KEY)}")
         
-        query = f"""
-[out:json];
-(
-  node["{key}"="{value}"]({bbox["south"]},{bbox["west"]},{bbox["north"]},{bbox["east"]});
-  way["{key}"="{value}"]({bbox["south"]},{bbox["west"]},{bbox["north"]},{bbox["east"]});
-  relation["{key}"="{value}"]({bbox["south"]},{bbox["west"]},{bbox["north"]},{bbox["east"]});
-);
-out center 10;
-"""
+        # Check if this is a niche activity that should bypass Geoapify
+        activity_lower = activity.lower()
+        if any(niche in activity_lower for niche in NICHE_ACTIVITIES):
+            logger.info(f"Niche activity detected: {activity}, skipping Geoapify, using Claude fallback")
+            # We need city coordinates first for Claude fallback
+            geocode_url = "https://api.geoapify.com/v1/geocode/search"
+            geocode_params = {
+                "text": city,
+                "apiKey": GEOAPIFY_API_KEY,
+                "limit": 1
+            }
+            
+            geocode_response = requests.get(geocode_url, params=geocode_params, timeout=10)
+            geocode_response.raise_for_status()
+            
+            geocode_data = geocode_response.json()
+            features = geocode_data.get("features", [])
+            
+            if not features:
+                logger.error(f"City '{city}' not found")
+                return None
+            
+            coordinates = features[0]["geometry"]["coordinates"]
+            city_lon, city_lat = coordinates
+            
+            return await get_places_from_claude(city, activity, city_lat, city_lon)
         
-        url = "https://overpass-api.de/api/interpreter"
-        headers = {"Content-Type": "text/plain"}
-        response = requests.post(url, data=query, headers=headers, timeout=15)
-        response.raise_for_status()
+        # Step 1: Geocode the city
+        geocode_url = "https://api.geoapify.com/v1/geocode/search"
+        geocode_params = {
+            "text": city,
+            "apiKey": GEOAPIFY_API_KEY,
+            "limit": 1
+        }
         
-        data = response.json()
-        elements = data.get("elements", [])
+        logger.info(f"Geoapify geocode params: {geocode_params}")
+        
+        geocode_response = requests.get(geocode_url, params=geocode_params, timeout=10)
+        geocode_response.raise_for_status()
+        
+        geocode_data = geocode_response.json()
+        features = geocode_data.get("features", [])
+        
+        if not features:
+            logger.error(f"City '{city}' not found")
+            return None
+        
+        # Get coordinates (note: Geoapify returns [lon, lat])
+        coordinates = features[0]["geometry"]["coordinates"]
+        city_lon, city_lat = coordinates
+        
+        logger.info(f"Geocoded {city} to: {city_lat}, {city_lon}")
+        
+        # Step 2: Convert activity to Geoapify category
+        category = get_geoapify_category(activity)
+        if not category:
+            logger.error(f"Failed to convert activity to Geoapify category")
+            return None
+        
+        # Step 3: Search for places
+        places_url = "https://api.geoapify.com/v2/places"
+        places_params = {
+            "categories": category,
+            "filter": f"circle:{city_lon},{city_lat},3000",
+            "limit": 5,
+            "apiKey": GEOAPIFY_API_KEY
+        }
+        
+        # Debug logging
+        logger.info(f"Geoapify places URL: {places_url}")
+        logger.info(f"Geoapify places params: {places_params}")
+        
+        places_response = requests.get(places_url, params=places_params, timeout=15)
+        places_response.raise_for_status()
+        
+        places_data = places_response.json()
+        place_features = places_data.get("features", [])
         
         places = []
         
-        for element in elements:
-            # Handle coordinates for node vs way/relation
-            if element["type"] == "node":
-                lat = element["lat"]
-                lon = element["lon"]
-            elif "center" in element:
-                lat = element["center"]["lat"]
-                lon = element["center"]["lon"]
-            else:
+        for feature in place_features:
+            # Extract place information
+            properties = feature.get("properties", {})
+            name = properties.get("name", "")
+            
+            # Filter out unnamed places
+            if not name or name == "Unnamed Place":
                 continue
             
-            # Handle name with fallback
-            name = element.get("tags", {}).get("name", "Unnamed Place")
+            # Get coordinates (note: Geoapify returns [lon, lat])
+            place_coordinates = feature.get("geometry", {}).get("coordinates", [0, 0])
+            place_lon, place_lat = place_coordinates
             
             place = {
                 "name": name,
-                "lat": lat,
-                "lon": lon,
-                "source": "openstreetmap"
+                "address": properties.get("formatted", "Address not available"),
+                "rating": None,  # Geoapify doesn't provide ratings in free tier
+                "category": properties.get("categories", [""])[0] or "Place",
+                "lat": place_lat,
+                "lon": place_lon,
+                "google_maps_url": f"https://www.google.com/maps/search/?api=1&query={place_lat},{place_lon}",
+                "source": "geoapify"
             }
             places.append(place)
         
-        logger.info(f"Found {len(places)} OSM places")
-        return places
+        logger.info(f"Found {len(places)} Geoapify places")
+        
+        # Step 4: Check if results make sense with Claude
+        if places:
+            place_names = [f"{p['name']} ({p.get('category', 'Place')})" for p in places]
+            places_list = "\n".join(place_names)
+            
+            relevance_prompt = f"""Do any of these places relate to '{activity}'?
+Places: {places_list}
+Respond with only 'yes' or 'no'."""
+            
+            try:
+                relevance_message = client.messages.create(
+                    model="claude-haiku-4-5",
+                    max_tokens=10,
+                    messages=[
+                        {"role": "user", "content": relevance_prompt}
+                    ]
+                )
+                
+                relevance_response = relevance_message.content[0].text.strip().lower()
+                logger.info(f"Claude relevance check: {relevance_response}")
+                
+                if relevance_response == 'no':
+                    logger.info(f"Claude says places don't match, falling back to Claude suggestions")
+                    return await get_places_from_claude(city, activity, city_lat, city_lon)
+                    
+            except Exception as e:
+                logger.error(f"Error in relevance check: {str(e)}")
+                # Continue with Geoapify results if check fails
+        
+        return places[:5]  # Return max 5 results
+        
     except Exception as e:
-        logger.error(f"Error searching OSM places: {str(e)}")
+        logger.error(f"Error searching Geoapify places: {str(e)}")
         return None
+
+
+async def filter_places_by_offering(places: list, activity: str, city: str) -> list:
+    """
+    Filter places using Claude AI to determine which ones offer the requested activity.
+    
+    Args:
+        places: List of places from Geoapify
+        activity: Activity the user is looking for
+        city: City name for context
+        
+    Returns:
+        Filtered list of places, or original list if filtering fails
+    """
+    try:
+        logger.info(f"Filtering places for {activity} in {city}")
+        
+        # Create a list of place names and categories
+        places_info = []
+        for place in places:
+            places_info.append(f"{place['name']} ({place.get('category', 'Place')})")
+        
+        places_list = "\n".join(places_info)
+        
+        prompt = f"""The user is looking for '{activity}' in {city}.
+Here are some places: {places_list}
+
+Remove ONLY places that are completely unrelated (e.g. user wants karting, 
+remove swimming pools and libraries).
+Keep anything that could even loosely relate to the activity.
+If fewer than 2 places remain after filtering, return ALL original places instead.
+
+Respond with raw JSON array of place names to keep."""
+        
+        message = client.messages.create(
+            model="claude-haiku-4-5",
+            max_tokens=100,
+            messages=[
+                {"role": "user", "content": prompt}
+            ]
+        )
+        
+        raw_response = message.content[0].text
+        
+        # Clean the response by removing markdown code blocks
+        cleaned_response = raw_response.strip()
+        cleaned_response = cleaned_response.replace("```json", "").replace("```", "").strip()
+        
+        # Parse the JSON response
+        import json
+        places_to_keep = json.loads(cleaned_response)
+        
+        # Filter the original places list
+        filtered_places = []
+        for place in places:
+            if place["name"] in places_to_keep:
+                filtered_places.append(place)
+        
+        # If fewer than 2 places remain, return all original places
+        if len(filtered_places) < 2:
+            logger.info(f"Only {len(filtered_places)} places remain after filtering, returning all {len(places)} original places")
+            return places
+        
+        logger.info(f"Filtered {len(places)} places to {len(filtered_places)} relevant ones")
+        return filtered_places
+        
+    except Exception as e:
+        logger.error(f"Error filtering places: {str(e)}")
+        # If filtering fails, return the original list
+        return places
 
 
 @app.post("/places")
@@ -426,50 +588,22 @@ async def get_places(request: PlacesRequest) -> Dict[str, Any]:
     try:
         logger.info(f"Processing places request for {request.activity} in {request.city}")
         
-        # Step 1: Convert activity to OSM tags using Claude
-        tags = await convert_activity_to_osm_tags(request.activity)
+        # Step 1: Find places using Geoapify API
+        places = await find_places_with_geoapify(request.city, request.activity)
             
-        if not tags or "key" not in tags or "value" not in tags:
+        if not places:
             return {
                 "status": "error",
-                "data": {"message": f"Failed to convert activity '{request.activity}' to OSM tags."}
+                "data": {"message": "No places found for that activity in this city."}
             }
         
-        # Step 2: Get city bounding box
-        bbox = await get_city_bounding_box(request.city)
-            
-        if not bbox:
-            return {
-                "status": "error",
-                "data": {"message": "City not found."}
-            }
-        
-        # Step 3: Find places using Overpass API
-        places = await find_places_with_osm_tags(tags["key"], tags["value"], bbox)
-            
-        if places is None:
-            return {
-                "status": "error",
-                "data": {"message": "Places service is currently unavailable."}
-            }
-        
-        # Step 4: Fallback to Claude if no OSM places found
-        if len(places) == 0:
-            logger.info(f"No OSM places found, trying Claude fallback")
-            claude_places = await get_places_from_claude(request.city, request.activity)
-                
-            if claude_places and len(claude_places) > 0:
-                places = claude_places
-            else:
-                return {
-                    "status": "error",
-                    "data": {"message": "No places found for that activity in this city."}
-                }
+        # Step 2: Filter places using Claude to ensure they offer the requested activity
+        filtered_places = await filter_places_by_offering(places, request.activity, request.city)
         
         response_data = {
             "city": request.city,
             "activity": request.activity,
-            "places": places
+            "places": filtered_places
         }
         
         logger.info(f"Successfully processed places request for {request.city}")
@@ -543,6 +677,51 @@ Be specific, warm, and helpful. Keep it under 150 words."""
         return "Recommendation unavailable at this time."
 
 
+def clean_activity(activity: str) -> str:
+    """
+    Clean activity string by removing time words and filler words.
+    
+    Args:
+        activity: Raw activity string from user
+        
+    Returns:
+        Cleaned activity string
+    """
+    import re
+    
+    # Convert to lowercase for processing
+    cleaned = activity.lower().strip()
+    
+    # Remove time-related phrases
+    time_patterns = [
+        r'\btomorrow\b',
+        r'\btoday\b', 
+        r'\btonight\b',
+        r'\bthis evening\b',
+        r'\bin \d+ days?\b',
+        r'\bnext week\b'
+    ]
+    
+    for pattern in time_patterns:
+        cleaned = re.sub(pattern, '', cleaned)
+    
+    # Remove filler phrases
+    filler_patterns = [
+        r'\bi want to\b',
+        r'\bfind me\b',
+        r'\blooking for\b',
+        r'\bi want to go\b'
+    ]
+    
+    for pattern in filler_patterns:
+        cleaned = re.sub(pattern, '', cleaned)
+    
+    # Clean up extra spaces and return
+    cleaned = re.sub(r'\s+', ' ', cleaned).strip()
+    
+    return cleaned if cleaned else activity
+
+
 @app.post("/advisor")
 async def get_advisor(request: AdvisorRequest) -> Dict[str, Any]:
     """
@@ -557,6 +736,10 @@ async def get_advisor(request: AdvisorRequest) -> Dict[str, Any]:
     try:
         logger.info(f"Processing advisor request for {request.activity} in {request.city} in {request.days_ahead} days")
         
+        # Clean the activity for places API
+        cleaned_activity = clean_activity(request.activity)
+        logger.info(f"Cleaned activity: '{cleaned_activity}'")
+        
         # Step 1: Get weather data
         weather_request = WeatherRequest(city=request.city, days_ahead=request.days_ahead)
         weather_response = await get_weather(weather_request)
@@ -566,8 +749,8 @@ async def get_advisor(request: AdvisorRequest) -> Dict[str, Any]:
         
         weather_data = weather_response["data"]
         
-        # Step 2: Get places data
-        places_request = PlacesRequest(city=request.city, activity=request.activity)
+        # Step 2: Get places data with cleaned activity
+        places_request = PlacesRequest(city=request.city, activity=cleaned_activity)
         places_response = await get_places(places_request)
             
         if places_response["status"] != "ok":
@@ -578,7 +761,7 @@ async def get_advisor(request: AdvisorRequest) -> Dict[str, Any]:
         # Step 3: Generate recommendation
         recommendation = await generate_recommendation(
             request.city, 
-            request.activity, 
+            request.activity,  # Keep original activity for recommendation text
             request.days_ahead, 
             weather_data, 
             places_data
@@ -598,6 +781,83 @@ async def get_advisor(request: AdvisorRequest) -> Dict[str, Any]:
         
     except Exception as e:
         logger.error(f"Error in advisor endpoint: {str(e)}")
+        return {
+            "status": "error",
+            "data": {"message": f"Unexpected error: {str(e)}"}
+        }
+
+
+async def get_place_details(city: str, place_name: str) -> Optional[str]:
+    """
+    Get detailed information about a specific place using Claude AI.
+    
+    Args:
+        city: Name of the city
+        place_name: Name of the specific place
+        
+    Returns:
+        Detailed place information as string, or None if failed
+    """
+    try:
+        logger.info(f"Getting details for {place_name} in {city}")
+        prompt = f"""Give practical information about {place_name} in {city}. Include:
+   1. What kind of place it is
+   2. What to expect when you visit
+   3. Price range (if known)
+   4. Best time to visit
+   5. One insider tip
+   Be friendly and specific. Keep it under 120 words."""
+        
+        message = client.messages.create(
+            model="claude-haiku-4-5",
+            max_tokens=200,
+            messages=[
+                {"role": "user", "content": prompt}
+            ]
+        )
+        
+        details = message.content[0].text.strip()
+        logger.info(f"Successfully got details for {place_name}")
+        return details
+    except Exception as e:
+        logger.error(f"Error getting place details: {str(e)}")
+        return None
+
+
+@app.post("/details")
+async def get_place_details_endpoint(request: DetailsRequest) -> Dict[str, Any]:
+    """
+    Get detailed information about a specific place in a city.
+    
+    Args:
+        request: DetailsRequest with city and place_name
+        
+    Returns:
+        Place details or error message
+    """
+    try:
+        logger.info(f"Processing details request for {request.place_name} in {request.city}")
+        
+        # Get place details from Claude
+        details = await get_place_details(request.city, request.place_name)
+            
+        if not details:
+            return {
+                "status": "error",
+                "data": {"message": "Place details unavailable at this time."}
+            }
+        
+        response_data = {
+            "place_name": request.place_name,
+            "city": request.city,
+            "details": details
+        }
+        
+        logger.info(f"Successfully processed details request for {request.place_name}")
+        return {"status": "ok", "data": response_data}
+        
+    except Exception as e:
+        logger.error(f"Error in details endpoint: {str(e)}")
         return {
             "status": "error",
             "data": {"message": f"Unexpected error: {str(e)}"}
