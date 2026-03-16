@@ -5,6 +5,9 @@ Combines real weather data, local place discovery, and AI reasoning
 
 import os
 import logging
+import json
+import re
+import math
 from typing import Dict, Any, Optional
 from datetime import datetime, timedelta
 
@@ -271,9 +274,10 @@ def get_geoapify_category(activity: str) -> str:
         # Lowercase the activity for matching
         activity_lower = activity.lower()
         
-        # Check for keyword matches
+        # Check for keyword matches using whole words only
+        import re
         for keyword, category in GEOAPIFY_CATEGORIES.items():
-            if keyword in activity_lower:
+            if re.search(r'\b' + re.escape(keyword) + r'\b', activity_lower):
                 logger.info(f"Matched keyword '{keyword}' to category '{category}'")
                 return category
         
@@ -302,12 +306,16 @@ async def get_places_from_claude(city: str, activity: str, city_lat: float, city
     try:
         logger.info(f"Getting places from Claude for {activity} in {city}")
         prompt = f"""List 3-5 real places in {city} where someone can do {activity}.
-Respond ONLY with raw JSON, no markdown:
-[{{"name": "Place Name", "address": "Street address", "category": "Type of place"}}]"""
+For each place provide the real approximate GPS coordinates.
+IMPORTANT: No apostrophes in any text.
+Respond ONLY with raw JSON array, no markdown:
+[{{"name": "...", "address": "...", "category": "...", "lat": 47.0245, "lon": 28.8322}}]
+
+Use real GPS coordinates for each specific location, not city center."""
         
         message = client.messages.create(
             model="claude-haiku-4-5",
-            max_tokens=200,
+            max_tokens=2000,
             messages=[
                 {"role": "user", "content": prompt}
             ]
@@ -315,13 +323,15 @@ Respond ONLY with raw JSON, no markdown:
         
         raw_response = message.content[0].text
         
-        # Clean the response by removing markdown code blocks
-        cleaned_response = raw_response.strip()
-        cleaned_response = cleaned_response.replace("```json", "").replace("```", "").strip()
+        # Log the raw Claude response for debugging
+        logger.info(f"Raw Claude places response: {raw_response}")
         
-        # Parse the JSON response
-        import json
-        places = json.loads(cleaned_response)
+        # Use safe JSON parsing
+        places = safe_parse_json(raw_response)
+        
+        if places is None:
+            logger.error(f"Failed to parse Claude JSON response")
+            return None
         
         # Add source and coordinates to each place
         for place in places:
@@ -338,11 +348,82 @@ Respond ONLY with raw JSON, no markdown:
         return None
 
 
+import re
+
+def safe_parse_json(raw: str):
+    """Safely parse JSON from Claude response, handling special characters"""
+    raw = raw.strip()
+    
+    # Remove markdown code blocks
+    raw = raw.replace("```json", "").replace("```", "").strip()
+    
+    # Find the JSON array
+    start = raw.find('[')
+    end = raw.rfind(']') + 1
+    if start == -1 or end <= start:
+        return None
+    raw = raw[start:end]
+    
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        # Replace smart apostrophes and problematic characters
+        raw = raw.replace('\u2019', '').replace('\u2018', '')
+        raw = raw.replace("McDonald's", "McDonalds")
+        raw = raw.replace("'s", "s")
+        # Remove any remaining unescaped single quotes inside strings
+        raw = re.sub(r"(?<=[a-zA-Z])'(?=[a-zA-Z])", "", raw)
+        try:
+            return json.loads(raw)
+        except json.JSONDecodeError:
+            return None
+
+
+def sort_by_proximity(primary_places: list, secondary_places: list) -> list:
+    """Sort secondary places by distance to the first primary place"""
+    if not primary_places or not secondary_places:
+        return secondary_places
+    
+    # Use first primary place as reference point
+    ref_lat = primary_places[0].get("lat", 0)
+    ref_lon = primary_places[0].get("lon", 0)
+    
+    def distance(place):
+        lat = place.get("lat", 0)
+        lon = place.get("lon", 0)
+        # Simple Euclidean distance (good enough for same city)
+        return math.sqrt((lat - ref_lat)**2 + (lon - ref_lon)**2)
+    
+    return sorted(secondary_places, key=distance)
+
+
+def create_bundles(places_by_activity: dict) -> list:
+    """Create bundled place pairs from multiple activities"""
+    activities = list(places_by_activity.keys())
+    if len(activities) < 2:
+        return []
+    
+    primary = places_by_activity[activities[0]]  # e.g. bowling
+    secondary = places_by_activity[activities[1]]  # e.g. mcdonalds
+    
+    bundles = []
+    for i in range(min(len(primary), len(secondary), 5)):
+        bundles.append({
+            "primary": primary[i],
+            "secondary": secondary[i],
+            "primary_activity": activities[0],
+            "secondary_activity": activities[1]
+        })
+    return bundles
+
+
 NICHE_ACTIVITIES = [
     "karting", "go kart", "billiards", "pool", "snooker",
     "escape room", "laser tag", "paintball", "trampoline",
     "climbing", "archery", "mini golf", "axe throwing",
-    "virtual reality", "vr", "bowling"
+    "virtual reality", "vr", "bowling",
+    "mcdonald's", "mcdonalds", "kfc", "burger king", "subway", "pizza hut",
+    "eat mcdonalds", "eat mcdonald", "mcdonalds", "mcdonald"
 ]
 
 
@@ -364,7 +445,7 @@ async def find_places_with_geoapify(city: str, activity: str) -> Optional[list]:
         # Check if this is a niche activity that should bypass Geoapify
         activity_lower = activity.lower()
         if any(niche in activity_lower for niche in NICHE_ACTIVITIES):
-            logger.info(f"Niche activity detected: {activity}, skipping Geoapify, using Claude fallback")
+            logger.info(f"Niche activity detected: {activity}, using Claude fallback directly")
             # We need city coordinates first for Claude fallback
             geocode_url = "https://api.geoapify.com/v1/geocode/search"
             geocode_params = {
@@ -373,7 +454,7 @@ async def find_places_with_geoapify(city: str, activity: str) -> Optional[list]:
                 "limit": 1
             }
             
-            geocode_response = requests.get(geocode_url, params=geocode_params, timeout=10)
+            geocode_response = requests.get(geocode_url, params=geocode_params, timeout=20)
             geocode_response.raise_for_status()
             
             geocode_data = geocode_response.json()
@@ -398,7 +479,7 @@ async def find_places_with_geoapify(city: str, activity: str) -> Optional[list]:
         
         logger.info(f"Geoapify geocode params: {geocode_params}")
         
-        geocode_response = requests.get(geocode_url, params=geocode_params, timeout=10)
+        geocode_response = requests.get(geocode_url, params=geocode_params, timeout=20)
         geocode_response.raise_for_status()
         
         geocode_data = geocode_response.json()
@@ -433,7 +514,7 @@ async def find_places_with_geoapify(city: str, activity: str) -> Optional[list]:
         logger.info(f"Geoapify places URL: {places_url}")
         logger.info(f"Geoapify places params: {places_params}")
         
-        places_response = requests.get(places_url, params=places_params, timeout=15)
+        places_response = requests.get(places_url, params=places_params, timeout=20)
         places_response.raise_for_status()
         
         places_data = places_response.json()
@@ -546,13 +627,15 @@ Respond with raw JSON array of place names to keep."""
         
         raw_response = message.content[0].text
         
-        # Clean the response by removing markdown code blocks
-        cleaned_response = raw_response.strip()
-        cleaned_response = cleaned_response.replace("```json", "").replace("```", "").strip()
+        # Log the raw Claude response for debugging
+        logger.info(f"Raw Claude filtering response: {raw_response}")
         
-        # Parse the JSON response
-        import json
-        places_to_keep = json.loads(cleaned_response)
+        # Use safe JSON parsing
+        places_to_keep = safe_parse_json(raw_response)
+        
+        if places_to_keep is None:
+            logger.error(f"Failed to parse Claude filtering response")
+            return places
         
         # Filter the original places list
         filtered_places = []
@@ -617,7 +700,7 @@ async def get_places(request: PlacesRequest) -> Dict[str, Any]:
         }
 
 
-async def generate_recommendation(city: str, activity: str, days_ahead: int, weather: Dict[str, Any], places: list) -> str:
+async def generate_recommendation(city: str, activity: str, days_ahead: int, weather: Dict[str, Any], places: list, places_by_activity: Dict[str, list] = None) -> str:
     """
     Generate personalized recommendation using Claude AI.
     
@@ -627,6 +710,7 @@ async def generate_recommendation(city: str, activity: str, days_ahead: int, wea
         days_ahead: Days ahead for the activity
         weather: Weather data dictionary
         places: List of places
+        places_by_activity: Dictionary of places organized by activity (for multi-activity requests)
         
     Returns:
         Personalized recommendation text
@@ -634,15 +718,43 @@ async def generate_recommendation(city: str, activity: str, days_ahead: int, wea
     try:
         logger.info(f"Generating recommendation for {activity} in {city}")
         
-        # Format places list nicely
-        places_text = ""
-        for i, place in enumerate(places, 1):
-            if place.get("source") == "openstreetmap":
-                places_text += f"{i}. {place['name']} (OSM data)\n"
-            else:
-                places_text += f"{i}. {place['name']} - {place.get('address', 'Address unknown')} - {place.get('note', '')}\n"
-        
-        prompt = f"""The user wants to do {activity} in {city} in {days_ahead} day(s).
+        # Check if this is a multi-activity request
+        if places_by_activity and len(places_by_activity) > 1:
+            # Multi-activity recommendation
+            places_text = ""
+            for activity_name, activity_places in places_by_activity.items():
+                if activity_places:
+                    places_text += f"\n{activity_name.title()} venues:\n"
+                    for i, place in enumerate(activity_places, 1):
+                        places_text += f"{i}. {place['name']} - {place.get('address', 'Address unknown')}\n"
+            
+            prompt = f"""The user wants to do {activity} in {city} in {days_ahead} day(s).
+   
+Weather forecast:
+- Max temperature: {weather['temperature_max']}°C
+- Min temperature: {weather['temperature_min']}°C
+- Wind speed: {weather['wind_speed']} km/h
+- Weather code: {weather['weathercode']}
+   
+{places_text}
+   
+Give a friendly, personalized recommendation that covers all activities in order:
+1. Which places to visit for each activity and why
+2. What to wear based on the weather
+3. Best timing for each activity
+4. One practical tip for the overall plan
+   
+Be specific, warm, and helpful. Keep it under 200 words."""
+        else:
+            # Single activity recommendation (original logic)
+            places_text = ""
+            for i, place in enumerate(places, 1):
+                if place.get("source") == "openstreetmap":
+                    places_text += f"{i}. {place['name']} (OSM data)\n"
+                else:
+                    places_text += f"{i}. {place['name']} - {place.get('address', 'Address unknown')} - {place.get('note', '')}\n"
+            
+            prompt = f"""The user wants to do {activity} in {city} in {days_ahead} day(s).
    
 Weather forecast:
 - Max temperature: {weather['temperature_max']}°C
@@ -663,7 +775,7 @@ Be specific, warm, and helpful. Keep it under 150 words."""
         
         message = client.messages.create(
             model="claude-haiku-4-5",
-            max_tokens=250,
+            max_tokens=300,
             messages=[
                 {"role": "user", "content": prompt}
             ]
@@ -692,6 +804,13 @@ def clean_activity(activity: str) -> str:
     # Convert to lowercase for processing
     cleaned = activity.lower().strip()
     
+    # Remove stray quotes and normalize
+    cleaned = cleaned.replace('"', '').replace("'s", "s")
+    cleaned = ' '.join(cleaned.split())  # normalize spaces
+    
+    # Remove "eat " prefix from activities
+    cleaned = re.sub(r'^eat\s+', '', cleaned)
+    
     # Remove time-related phrases
     time_patterns = [
         r'\btomorrow\b',
@@ -699,7 +818,10 @@ def clean_activity(activity: str) -> str:
         r'\btonight\b',
         r'\bthis evening\b',
         r'\bin \d+ days?\b',
-        r'\bnext week\b'
+        r'\bnext week\b',
+        r'\btoday\b',
+        r'\btomorrow\b',
+        r'\btonight\b'
     ]
     
     for pattern in time_patterns:
@@ -710,16 +832,76 @@ def clean_activity(activity: str) -> str:
         r'\bi want to\b',
         r'\bfind me\b',
         r'\blooking for\b',
-        r'\bi want to go\b'
+        r'\bi want to go\b',
+        r'\bi would like to\b',
+        r'\bcan you find\b',
+        r'\bshow me\b',
+        r'\bwhere can i\b'
     ]
     
     for pattern in filler_patterns:
         cleaned = re.sub(pattern, '', cleaned)
     
+    logger.debug(f"Cleaned activity: {cleaned}")
     # Clean up extra spaces and return
     cleaned = re.sub(r'\s+', ' ', cleaned).strip()
     
     return cleaned if cleaned else activity
+
+
+def detect_multiple_activities(activity: str) -> list:
+    """
+    Detect if user is asking for multiple activities and split them.
+    
+    Args:
+        activity: Raw activity string from user
+        
+    Returns:
+        List of individual activities
+    """
+    logger.info(f"Raw user message: {activity}")
+    
+    # Split on exact patterns BEFORE any cleaning
+    split_patterns = [
+        " and then ",
+        " and after ",
+        " then ",
+        " after that ",
+        " and also ",
+        " and ",
+        " plus "
+    ]
+    
+    current_activity = activity
+    activities = []
+    split_result = []
+    
+    # Try each split pattern
+    for pattern in split_patterns:
+        if pattern in current_activity.lower():
+            parts = current_activity.split(pattern)
+            if len(parts) >= 2:
+                # Take the first two parts for now (can handle more later)
+                activities = [parts[0].strip(), parts[1].strip()]
+                split_result = parts
+                logger.info(f"Split on '{pattern}': {split_result}")
+                break
+    
+    # If no split found, treat as single activity
+    if not activities:
+        activities = [activity.strip()]
+        split_result = [activity]
+        logger.info(f"No split found, treating as single activity: {split_result}")
+    
+    # Clean each activity separately
+    cleaned_activities = []
+    for activity_part in activities:
+        cleaned = clean_activity(activity_part)
+        if cleaned:
+            cleaned_activities.append(cleaned)
+    
+    logger.info(f"Extracted activities: {cleaned_activities}")
+    return cleaned_activities
 
 
 @app.post("/advisor")
@@ -736,9 +918,9 @@ async def get_advisor(request: AdvisorRequest) -> Dict[str, Any]:
     try:
         logger.info(f"Processing advisor request for {request.activity} in {request.city} in {request.days_ahead} days")
         
-        # Clean the activity for places API
-        cleaned_activity = clean_activity(request.activity)
-        logger.info(f"Cleaned activity: '{cleaned_activity}'")
+        # Detect and split multiple activities
+        activities = detect_multiple_activities(request.activity)
+        logger.info(f"Activities to process: {activities}")
         
         # Step 1: Get weather data
         weather_request = WeatherRequest(city=request.city, days_ahead=request.days_ahead)
@@ -749,14 +931,31 @@ async def get_advisor(request: AdvisorRequest) -> Dict[str, Any]:
         
         weather_data = weather_response["data"]
         
-        # Step 2: Get places data with cleaned activity
-        places_request = PlacesRequest(city=request.city, activity=cleaned_activity)
-        places_response = await get_places(places_request)
-            
-        if places_response["status"] != "ok":
-            return places_response
+        # Step 2: Get places data for each activity
+        places_by_activity = {}
+        all_places = []
         
-        places_data = places_response["data"]["places"]
+        for activity in activities:
+            places_request = PlacesRequest(city=request.city, activity=activity)
+            places_response = await get_places(places_request)
+            
+            if places_response["status"] == "ok":
+                activity_places = places_response["data"]["places"]
+                places_by_activity[activity] = activity_places
+                all_places.extend(activity_places)
+            else:
+                places_by_activity[activity] = []
+        
+        # Step 2.5: Sort secondary activities by proximity to first activity
+        activities_list = list(places_by_activity.keys())
+        if len(activities_list) > 1:
+            primary_places = places_by_activity[activities_list[0]]
+            for activity in activities_list[1:]:
+                places_by_activity[activity] = sort_by_proximity(
+                    primary_places, 
+                    places_by_activity[activity]
+                )
+                logger.info(f"Sorted {activity} places by proximity to {activities_list[0]}")
         
         # Step 3: Generate recommendation
         recommendation = await generate_recommendation(
@@ -764,7 +963,8 @@ async def get_advisor(request: AdvisorRequest) -> Dict[str, Any]:
             request.activity,  # Keep original activity for recommendation text
             request.days_ahead, 
             weather_data, 
-            places_data
+            all_places,
+            places_by_activity  # Pass places by activity for multi-activity recommendations
         )
         
         # Combine all results
@@ -772,7 +972,9 @@ async def get_advisor(request: AdvisorRequest) -> Dict[str, Any]:
             "city": request.city,
             "activity": request.activity,
             "weather": weather_data,
-            "places": places_data,
+            "places_by_activity": places_by_activity,
+            "places": all_places,  # Keep flat list for backwards compatibility
+            "bundles": create_bundles(places_by_activity),  # Add bundled place pairs
             "recommendation": recommendation
         }
         
